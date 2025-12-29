@@ -13,7 +13,10 @@
 
 #include "../exception.h"
 #include "../fp4_layout.cuh"
+#ifndef __CUDA_ARCH__
+// Only include logging.h for host code, not for device code (kernels)
 #include "../logging.h"
+#endif
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
 
@@ -624,7 +627,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleV
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   // Pre-compute constant: reciprocal of 6.0 (maximum value of e2m1)
   static constexpr float RECIPROCAL_6 = 1.0f / 6.0f;
-
+  
   // Get absolute maximum values among the local 8 values.
   auto localMax = maths::cuda_abs(get_vec2_element(vec, 0));
 
@@ -672,8 +675,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleV
   }
 
   // Convert the input to float and quantize (pipelined to reduce register usage).
-  // Optimization: use single float2 instead of array to reduce register pressure from 32 bytes to 8
-  // bytes
+  // Optimization: use single float2 instead of array to reduce register pressure from 32 bytes to 8 bytes
   uint32_t e2m1Vec = 0;
 
 #pragma unroll
@@ -687,7 +689,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleV
     }
     fp2Val.x *= outputScale;
     fp2Val.y *= outputScale;
-
+    
     // Convert pair immediately and pack into result
     uint8_t e2m1Pair = fp32_pair_to_e2m1(fp2Val);
     e2m1Vec |= (static_cast<uint32_t>(e2m1Pair) << (i * 8));
@@ -983,7 +985,7 @@ class FusedOp {
           utils::cvt_warp_fp16_to_fp4<T, VEC_SIZE>(val, m_scale_factor, sf_out);
     } else
 #endif
-        if constexpr (GetQuantType<Pattern> == QuantType::kFP8) {
+    if constexpr (GetQuantType<Pattern> == QuantType::kFP8) {
       using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
       PackedQuantizedType ret;
 #pragma unroll
@@ -1425,32 +1427,78 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
     max_registers = utils::getSMRegisters();
   }
   int max_threads_per_block = min(max_registers / registers_per_thread, 1024);
-
   int block_size = threads_per_block;
-
+  
   // FP4 optimization: apply BEFORE SM count check to avoid being overridden
   // This allows FP4 to use smaller block_size even when cluster_num is large
+  // Note: FP4 optimization is only for Blackwell (SM >= 100) architecture
   if constexpr (GetQuantType<Pattern> == QuantType::kFP4) {
-    // Try to use 160 as block_size if possible (better occupancy for FP4)
-    if (threads_per_token % 160 == 0 && 160 <= max_threads_per_block && 160 >= 128) {
-      block_size = 160;
-      cluster_size = threads_per_token / 160;
-      if (cluster_size > 8) cluster_size = 8;
+    // Only apply FP4 optimization on Blackwell (SM >= 100)
+    if (SM >= 100) {
+      // Helper function to check if a number is a power of 2
+      auto is_power_of_2 = [](int n) -> bool {
+        return n > 0 && (n & (n - 1)) == 0;
+      };
+      
+      // Helper function to find valid block_size that maintains threads_per_token == block_size * cluster_size
+      // and cluster_size is a power of 2. Returns true if a valid configuration is found.
+      auto find_valid_block_size = [&](int preferred_block_size) -> bool {
+        if (threads_per_token % preferred_block_size != 0) {
+          return false;
+        }
+        int candidate_cluster_size = threads_per_token / preferred_block_size;
+        if (is_power_of_2(candidate_cluster_size)) {
+          // Preferred block_size works, maintains invariant: threads_per_token == block_size * cluster_size
+          block_size = preferred_block_size;
+          cluster_size = candidate_cluster_size;
+          return true;
+        } else {
+          // candidate_cluster_size is not a power of 2, need to adjust block_size
+          // Try larger block_size values to make cluster_size a power of 2
+          // Try cluster_size = 1, 2, 4, 8, 16, 32, ... (powers of 2)
+          for (int target_cluster_size = 1; target_cluster_size <= threads_per_token; target_cluster_size *= 2) {
+            int new_block_size = threads_per_token / target_cluster_size;
+            // Verify: threads_per_token == new_block_size * target_cluster_size
+            if (new_block_size * target_cluster_size == threads_per_token &&
+                new_block_size <= max_threads_per_block && 
+                new_block_size >= 128 &&
+                new_block_size % preferred_block_size == 0) {  // Prefer multiples of preferred_block_size
+              block_size = new_block_size;
+              cluster_size = target_cluster_size;
+              return true;
+            }
+          }
+        }
+        return false;
+      };
+      
+      // Try to use 160 as block_size if possible (better occupancy for FP4)
+      if (160 <= max_threads_per_block) {
+        if (find_valid_block_size(160)) {
+          // Successfully found valid block_size
+        }
+        // else: cannot satisfy constraint, fall back to default block_size
+      }
+      // Fallback: try 192 if 160 doesn't work
+      else if (192 <= max_threads_per_block) {
+        if (find_valid_block_size(192)) {
+          // Successfully found valid block_size
+        }
+        // else: cannot satisfy constraint, fall back to default block_size
+      }
+      // Fallback: try 128 if 192 doesn't work
+      else if (128 <= max_threads_per_block) {
+        if (find_valid_block_size(128)) {
+          // Successfully found valid block_size
+        }
+        // else: cannot satisfy constraint, fall back to default block_size
+      }
+      // Update threads_per_block to match block_size for SM count check
+      threads_per_block = block_size;
     }
-    // Fallback: try 192, 128 if 160 doesn't work
-    else if (threads_per_token % 192 == 0 && 192 <= max_threads_per_block && 192 >= 128) {
-      block_size = 192;
-      cluster_size = threads_per_token / 192;
-      if (cluster_size > 8) cluster_size = 8;
-    } else if (threads_per_token % 128 == 0 && 128 <= max_threads_per_block) {
-      block_size = 128;
-      cluster_size = threads_per_token / 128;
-      if (cluster_size > 8) cluster_size = 8;
-    }
-    // Update threads_per_block to match block_size for SM count check
-    threads_per_block = block_size;
+    // For SM < 100 (Hopper or older), don't apply FP4 optimization, use default block_size
   }
-
+  
   // SM count check: adjust if cluster_num * cluster_size > sm_count
   // But respect FP4 optimization if already applied
   while (cluster_num * cluster_size > sm_count && cluster_size > 1 &&
@@ -1462,17 +1510,18 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
       block_size = threads_per_block;
     }
   }
-
+  
   // Update block_size if not FP4 (FP4 already set it above)
   if constexpr (GetQuantType<Pattern> != QuantType::kFP4) {
     block_size = threads_per_block;
   }
-
+  
   // Check conditions using the final block_size (not threads_per_block)
-  FLASHINFER_CHECK(oneshot || block_size >= params.nranks, "not oneshot, or block_size < nranks");
+  FLASHINFER_CHECK(oneshot || block_size >= params.nranks,
+                   "not oneshot, or block_size < nranks");
   FLASHINFER_CHECK(block_size <= 1024 && cluster_size > 0,
                    "block_size > 1024 or cluster_size <= 0");
-
+  
   int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
   cudaLaunchConfig_t cfg;
   cudaLaunchAttribute attribute[2];
